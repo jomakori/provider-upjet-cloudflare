@@ -109,18 +109,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { submodules: true }
 
+      # setup-go owns the Go cache; a second actions/cache on these paths exits 2.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with: { go-version: '${{ env.GO_VERSION }}' }
-
-      - name: Cache Go
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-            .work/pkg
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
+          go-version: '${{ env.GO_VERSION }}'
+          cache-dependency-path: '**/go.sum'
 
       - run: make vendor vendor.check
 
@@ -260,18 +253,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { submodules: true }
 
+      # setup-go owns the Go cache; a second actions/cache on these paths exits 2.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with: { go-version: '${{ env.GO_VERSION }}' }
-
-      - name: Cache Go
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-            .work/pkg
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
+          go-version: '${{ env.GO_VERSION }}'
+          cache-dependency-path: '**/go.sum'
 
       - run: make vendor vendor.check
 
