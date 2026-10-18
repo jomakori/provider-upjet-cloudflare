@@ -24,7 +24,7 @@ concurrency:
 env:
   GO_VERSION: '1.26'
   DOCKER_BUILDX_VERSION: 'v0.30.1'
-  UPBOUND_REGISTRY: xpkg.upbound.io/wildbitca
+  GHCR_REGISTRY: ghcr.io/jomakori
   OPENTOFU_VERSION: '1.11.5'
   TERRAFORM_PROVIDER_SOURCE: cloudflare/cloudflare
   TERRAFORM_PROVIDER_VERSION: '5.27.0'
@@ -34,17 +34,12 @@ env:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   # ── Resolve version + package list ────────────────────────────────────
   prepare:
     runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
-    # Gates the entire release before any build/publish work starts: nothing
-    # downstream runs until the custom deployment protection rule (deploy-gate,
-    # org-wide Slack emoji-reaction approval) clears. CI already ran on the
-    # commit before it was tagged, so there is no test signal lost by gating
-    # here instead of a later job.
-    environment: production
     outputs:
       version: ${{ steps.version.outputs.version }}
       subpackages: ${{ steps.packages.outputs.subpackages }}
@@ -92,68 +87,21 @@ jobs:
           echo "subpackages=$SUBPACKAGES" >> $GITHUB_OUTPUT
           echo "Will publish sub-providers: $SUBPACKAGES"
 
-  # ── Ensure Upbound repos exist (only for packages being published) ────
-  ensure-repos:
+  # ── Family config: build per-arch (amd64/arm64) ───────────────────────
+  family-config-build:
     runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
     needs: prepare
-    steps:
-      - name: Install up CLI
-        run: |
-          curl -fsSLo up "https://cli.upbound.io/stable/v0.54.0/bin/linux_amd64/up"
-          echo "99a666d01e92d7fb7f44bfc9baf436fc28247f6022faa11122b80f5b216bbf8f  up" | sha256sum -c -
-          chmod +x up
-          sudo mv up /usr/local/bin/up
-
-      - name: Authenticate with Upbound
-        run: up login -t "${{ secrets.UPBOUND_TOKEN }}"
-
-      - name: Ensure repos exist
-        env:
-          NEEDS_PREPARE_OUTPUTS_SUBPACKAGES: ${{ needs.prepare.outputs.subpackages }}
-        run: |
-          # Build the list of repos being published in this run.
-          # family-cloudflare is always included.
-          SUBPACKAGES=''"${NEEDS_PREPARE_OUTPUTS_SUBPACKAGES}"''
-          REPOS=("provider-family-cloudflare")
-          while IFS= read -r pkg; do
-            REPOS+=("provider-cloudflare-${pkg}")
-          done < <(echo "$SUBPACKAGES" | jq -r '.[]')
-
-          # Only create + publish repos that don't exist yet. Running
-          # `up repository update` for all ~60 repos on every publish trips
-          # Upbound's "Repository Update Rate Limit". Existing repos are already
-          # public+publish, so a get-and-skip is enough. A short retry absorbs
-          # transient "Rate Limit Exceeded" responses on create/update.
-          retry() {
-            local n=0
-            until "$@"; do
-              n=$((n + 1))
-              if [ "$n" -ge 5 ]; then
-                echo "command failed after $n attempts: $*" >&2
-                return 1
-              fi
-              echo "attempt $n failed, retrying in $((n * 15))s: $*" >&2
-              sleep $((n * 15))
-            done
-          }
-          for repo in "${REPOS[@]}"; do
-            if up repository get "$repo" >/dev/null 2>&1; then
-              echo "= $repo (exists)"
-              continue
-            fi
-            echo "Creating $repo..."
-            retry up repository create "$repo"
-            retry up repository update --private=false --publish --force "$repo"
-            echo "✓ $repo (created)"
-          done
-
-  # ── Family config (ProviderConfig CRDs — published before sub-providers) ──
-  family-config:
-    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
-    needs: [prepare, ensure-repos]
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     steps:
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with: { platforms: arm64 }
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with: { version: '${{ env.DOCKER_BUILDX_VERSION }}' }
 
@@ -176,49 +124,32 @@ jobs:
 
       - run: make vendor vendor.check
 
-      - name: Install CLIs
+      - name: Install Crossplane CLI
         run: |
-          curl -fsSLo up "https://cli.upbound.io/stable/v0.54.0/bin/linux_amd64/up"
-          echo "99a666d01e92d7fb7f44bfc9baf436fc28247f6022faa11122b80f5b216bbf8f  up" | sha256sum -c -
-          chmod +x up
-          sudo mv up /usr/local/bin/up
-          curl -fsSLo docker-credential-up "https://cli.upbound.io/stable/v0.54.0/bin/linux_amd64/docker-credential-up"
-          echo "336e7f4883d8c0b873f709febfae3ae9b6f60288ffb79a12cc9f0659e12066c9  docker-credential-up" | sha256sum -c -
-          chmod +x docker-credential-up
-          sudo mv docker-credential-up /usr/local/bin/docker-credential-up
           curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh" | sh
           sudo mv crossplane /usr/local/bin/crossplane
 
-      - name: Authenticate with Upbound
-        run: |
-          up login -t "${{ secrets.UPBOUND_TOKEN }}"
-          mkdir -p ~/.docker
-          config_file=~/.docker/config.json
-          if [ -f "$config_file" ]; then
-            jq '.credHelpers["xpkg.upbound.io"] = "up"' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-          else
-            echo '{"credHelpers":{"xpkg.upbound.io":"up"}}' > "$config_file"
-          fi
-
       - name: Build binary
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          CGO_ENABLED=0 GOOS=linux GOARCH=${MATRIX_ARCH} go build \
             -trimpath -installsuffix static \
             -ldflags "-X github.com/wildbitca/provider-upjet-cloudflare/internal/version.Version=${VERSION} -s -w" \
-            -o _output/bin/linux_amd64/config \
+            -o _output/bin/linux_${MATRIX_ARCH}/config \
             ./cmd/provider/config/
 
-      - name: Build image and xpkg
+      - name: Build runtime image (single-platform tarball)
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
         run: |
-          REPO="provider-family-cloudflare"
-
           BUILD_CTX=$(mktemp -d)
           cp cluster/images/provider-upjet-cloudflare/Dockerfile "${BUILD_CTX}/"
           cp cluster/images/provider-upjet-cloudflare/terraformrc.hcl "${BUILD_CTX}/"
           cp -r _output/bin/ "${BUILD_CTX}/bin"
 
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/${MATRIX_ARCH} \
             --build-arg SUBPACKAGE=config \
             --build-arg OPENTOFU_VERSION=${OPENTOFU_VERSION} \
             --build-arg TERRAFORM_PROVIDER_SOURCE=${TERRAFORM_PROVIDER_SOURCE} \
@@ -226,10 +157,15 @@ jobs:
             --build-arg TERRAFORM_PROVIDER_DOWNLOAD_NAME=${TERRAFORM_PROVIDER_DOWNLOAD_NAME} \
             --build-arg TERRAFORM_PROVIDER_DOWNLOAD_URL_PREFIX=${TERRAFORM_PROVIDER_DOWNLOAD_URL_PREFIX} \
             --build-arg TERRAFORM_NATIVE_PROVIDER_BINARY=${TERRAFORM_NATIVE_PROVIDER_BINARY} \
-            --cache-from type=gha --cache-to type=gha,mode=max \
-            -t build-${REPO}:latest --load \
+            --cache-from type=gha,scope=family-${MATRIX_ARCH} --cache-to type=gha,mode=max,scope=family-${MATRIX_ARCH} \
+            --output type=docker,dest=runtime-${MATRIX_ARCH}.tar \
             "${BUILD_CTX}"
 
+      - name: Build xpkg (single-platform)
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          REPO="provider-family-cloudflare"
           WORK_DIR=$(mktemp -d)
           mkdir -p "${WORK_DIR}/crds"
           cp package/crds/upjet-cloudflare.*.yaml "${WORK_DIR}/crds/" 2>/dev/null || true
@@ -241,7 +177,7 @@ jobs:
             name: provider-family-cloudflare
             annotations:
               meta.crossplane.io/maintainer: "Wildbit"
-              meta.crossplane.io/source: "https://github.com/wildbitca/provider-upjet-cloudflare"
+              meta.crossplane.io/source: "https://github.com/jomakori/provider-upjet-cloudflare"
               meta.crossplane.io/license: "Apache-2.0"
               meta.crossplane.io/description: "Upjet-based Crossplane provider family for the Cloudflare API. Shared ProviderConfig for all Cloudflare sub-providers."
             labels:
@@ -253,33 +189,70 @@ jobs:
           sed -i 's/^          //' "${WORK_DIR}/crossplane.yaml"
 
           crossplane xpkg build \
-            --embed-runtime-image="build-${REPO}:latest" \
+            --embed-runtime-image-tarball="runtime-${MATRIX_ARCH}.tar" \
             --package-root="${WORK_DIR}" \
-            --package-file="${WORK_DIR}/${REPO}.xpkg"
+            --package-file="${REPO}-${MATRIX_ARCH}.xpkg"
 
-          up xpkg push "${UPBOUND_REGISTRY}/${REPO}:${VERSION}" \
-            -f "${WORK_DIR}/${REPO}.xpkg"
+      - name: Upload single-platform package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: family-xpkg-${{ matrix.arch }}
+          path: "*.xpkg"
+          if-no-files-found: error
+          retention-days: 1
 
-          echo "Published: ${UPBOUND_REGISTRY}/${REPO}:${VERSION}"
-
-      - name: Append extensions
-        continue-on-error: true
-        run: |
-          up xpkg append --extensions-root=./extensions \
-            "${UPBOUND_REGISTRY}/provider-family-cloudflare:${VERSION}"
-
-  # ── Family sub-providers (only selected packages, parallel after family-config) ──
-  family-subproviders:
+  # ── Family config: push multi-platform package to GHCR ────────────────
+  family-config-push:
     runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
-    needs: [prepare, family-config]
+    needs: [prepare, family-config-build]
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    outputs:
+      version: ${{ env.VERSION }}
+    steps:
+      - name: Download single-platform packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: family-xpkg-*
+          path: .
+          merge-multiple: true
+
+      - name: Install Crossplane CLI
+        run: |
+          curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh" | sh
+          sudo mv crossplane /usr/local/bin/crossplane
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push multi-platform package
+        run: |
+          REPO="provider-family-cloudflare"
+          FILES=$(ls *.xpkg | tr '\n' ',' | sed 's/,$//')
+          crossplane --verbose xpkg push --package-files "${FILES}" "${GHCR_REGISTRY}/${REPO}:${VERSION}"
+          echo "Published: ${GHCR_REGISTRY}/${REPO}:${VERSION}"
+
+  # ── Family sub-providers: build per-package per-arch (only selected packages) ──
+  family-subproviders-build:
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
+    needs: [prepare, family-config-push]
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 16
       matrix:
         subpackage: ${{ fromJson(needs.prepare.outputs.subpackages) }}
+        arch: [amd64, arm64]
     steps:
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with: { platforms: arm64 }
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with: { version: '${{ env.DOCKER_BUILDX_VERSION }}' }
 
@@ -302,44 +275,27 @@ jobs:
 
       - run: make vendor vendor.check
 
-      - name: Install CLIs
+      - name: Install Crossplane CLI
         run: |
-          curl -fsSLo up "https://cli.upbound.io/stable/v0.54.0/bin/linux_amd64/up"
-          echo "99a666d01e92d7fb7f44bfc9baf436fc28247f6022faa11122b80f5b216bbf8f  up" | sha256sum -c -
-          chmod +x up
-          sudo mv up /usr/local/bin/up
-          curl -fsSLo docker-credential-up "https://cli.upbound.io/stable/v0.54.0/bin/linux_amd64/docker-credential-up"
-          echo "336e7f4883d8c0b873f709febfae3ae9b6f60288ffb79a12cc9f0659e12066c9  docker-credential-up" | sha256sum -c -
-          chmod +x docker-credential-up
-          sudo mv docker-credential-up /usr/local/bin/docker-credential-up
           curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh" | sh
           sudo mv crossplane /usr/local/bin/crossplane
-
-      - name: Authenticate with Upbound
-        run: |
-          up login -t "${{ secrets.UPBOUND_TOKEN }}"
-          mkdir -p ~/.docker
-          config_file=~/.docker/config.json
-          if [ -f "$config_file" ]; then
-            jq '.credHelpers["xpkg.upbound.io"] = "up"' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-          else
-            echo '{"credHelpers":{"xpkg.upbound.io":"up"}}' > "$config_file"
-          fi
 
       - name: Build binary
         env:
           MATRIX_SUBPACKAGE: ${{ matrix.subpackage }}
+          MATRIX_ARCH: ${{ matrix.arch }}
         run: |
           SP="${MATRIX_SUBPACKAGE}"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          CGO_ENABLED=0 GOOS=linux GOARCH=${MATRIX_ARCH} go build \
             -trimpath -installsuffix static \
             -ldflags "-X github.com/wildbitca/provider-upjet-cloudflare/internal/version.Version=${VERSION} -s -w" \
-            -o _output/bin/linux_amd64/${SP} \
+            -o _output/bin/linux_${MATRIX_ARCH}/${SP} \
             ./cmd/provider/${SP}/
 
-      - name: Build image, xpkg and publish
+      - name: Build runtime image (single-platform tarball)
         env:
           MATRIX_SUBPACKAGE: ${{ matrix.subpackage }}
+          MATRIX_ARCH: ${{ matrix.arch }}
         run: |
           SP="${MATRIX_SUBPACKAGE}"
           REPO="provider-cloudflare-${SP}"
@@ -350,7 +306,7 @@ jobs:
           cp -r _output/bin/ "${BUILD_CTX}/bin"
 
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/${MATRIX_ARCH} \
             --build-arg SUBPACKAGE=${SP} \
             --build-arg OPENTOFU_VERSION=${OPENTOFU_VERSION} \
             --build-arg TERRAFORM_PROVIDER_SOURCE=${TERRAFORM_PROVIDER_SOURCE} \
@@ -358,9 +314,17 @@ jobs:
             --build-arg TERRAFORM_PROVIDER_DOWNLOAD_NAME=${TERRAFORM_PROVIDER_DOWNLOAD_NAME} \
             --build-arg TERRAFORM_PROVIDER_DOWNLOAD_URL_PREFIX=${TERRAFORM_PROVIDER_DOWNLOAD_URL_PREFIX} \
             --build-arg TERRAFORM_NATIVE_PROVIDER_BINARY=${TERRAFORM_NATIVE_PROVIDER_BINARY} \
-            --cache-from type=gha --cache-to type=gha,mode=max \
-            -t build-${REPO}:latest --load \
+            --cache-from type=gha,scope=${REPO}-${MATRIX_ARCH} --cache-to type=gha,mode=max,scope=${REPO}-${MATRIX_ARCH} \
+            --output type=docker,dest=runtime-${MATRIX_ARCH}.tar \
             "${BUILD_CTX}"
+
+      - name: Build xpkg (single-platform)
+        env:
+          MATRIX_SUBPACKAGE: ${{ matrix.subpackage }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          SP="${MATRIX_SUBPACKAGE}"
+          REPO="provider-cloudflare-${SP}"
 
           WORK_DIR=$(mktemp -d)
           mkdir -p "${WORK_DIR}/crds"
@@ -376,14 +340,14 @@ jobs:
             name: ${REPO}
             annotations:
               meta.crossplane.io/maintainer: "Wildbit"
-              meta.crossplane.io/source: "https://github.com/wildbitca/provider-upjet-cloudflare"
+              meta.crossplane.io/source: "https://github.com/jomakori/provider-upjet-cloudflare"
               meta.crossplane.io/license: "Apache-2.0"
               meta.crossplane.io/description: "Crossplane provider for Cloudflare ${SP} resources. Part of provider-family-cloudflare."
             labels:
               pkg.crossplane.io/provider-family: provider-family-cloudflare
           spec:
             dependsOn:
-              - provider: ${UPBOUND_REGISTRY}/provider-family-cloudflare
+              - provider: ${GHCR_REGISTRY}/provider-family-cloudflare
                 version: ">= ${VERSION}"
             capabilities:
               - SafeStart
@@ -391,29 +355,63 @@ jobs:
           sed -i 's/^          //' "${WORK_DIR}/crossplane.yaml"
 
           crossplane xpkg build \
-            --embed-runtime-image="build-${REPO}:latest" \
+            --embed-runtime-image-tarball="runtime-${MATRIX_ARCH}.tar" \
             --package-root="${WORK_DIR}" \
-            --package-file="${WORK_DIR}/${REPO}.xpkg"
+            --package-file="${REPO}-${MATRIX_ARCH}.xpkg"
 
-          up xpkg push "${UPBOUND_REGISTRY}/${REPO}:${VERSION}" \
-            -f "${WORK_DIR}/${REPO}.xpkg"
+      - name: Upload single-platform package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: xpkg-${{ matrix.subpackage }}-${{ matrix.arch }}
+          path: "*.xpkg"
+          if-no-files-found: error
+          retention-days: 1
 
-          echo "Published: ${UPBOUND_REGISTRY}/${REPO}:${VERSION}"
+  # ── Family sub-providers: push multi-platform package to GHCR ─────────
+  family-subproviders-push:
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
+    needs: [prepare, family-subproviders-build]
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        subpackage: ${{ fromJson(needs.prepare.outputs.subpackages) }}
+    steps:
+      - name: Download single-platform packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: xpkg-${{ matrix.subpackage }}-*
+          path: .
+          merge-multiple: true
 
-      - name: Append extensions
-        continue-on-error: true
+      - name: Install Crossplane CLI
+        run: |
+          curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh" | sh
+          sudo mv crossplane /usr/local/bin/crossplane
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push multi-platform package
         env:
           MATRIX_SUBPACKAGE: ${{ matrix.subpackage }}
         run: |
           SP="${MATRIX_SUBPACKAGE}"
-          up xpkg append --extensions-root=./extensions \
-            "${UPBOUND_REGISTRY}/provider-cloudflare-${SP}:${VERSION}"
+          REPO="provider-cloudflare-${SP}"
+          FILES=$(ls *.xpkg | tr '\n' ',' | sed 's/,$//')
+          crossplane --verbose xpkg push --package-files "${FILES}" "${GHCR_REGISTRY}/${REPO}:${VERSION}"
+          echo "Published: ${GHCR_REGISTRY}/${REPO}:${VERSION}"
 
   # ── GitHub Release ────────────────────────────────────────────────────
   release:
     runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
-    needs: [prepare, family-subproviders]
-    if: always() && needs.family-subproviders.result == 'success'
+    needs: [prepare, family-subproviders-push]
+    if: always() && needs.family-subproviders-push.result == 'success'
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
