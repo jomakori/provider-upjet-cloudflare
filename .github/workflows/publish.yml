@@ -149,19 +149,19 @@ jobs:
 
   # ── Family config: build per-arch (amd64/arm64) ────────────────────────
   family-config-build:
-    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
+    runs-on: ${{ matrix.runner }}
     needs: [prepare, ensure-repos]
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+          - arch: arm64
+            runner: ${{ vars.ARM_CI_RUNNER || 'ubuntu-24.04-arm' }}
     steps:
-      - name: Setup QEMU
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with: { platforms: arm64 }
-
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with: { version: '${{ env.DOCKER_BUILDX_VERSION }}' }
 
@@ -181,6 +181,21 @@ jobs:
         run: |
           curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh" | sh
           sudo mv crossplane /usr/local/bin/crossplane
+
+      - name: Verify native runner architecture
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          case "${MATRIX_ARCH}" in
+            amd64) EXPECTED=x86_64 ;;
+            arm64) EXPECTED=aarch64 ;;
+          esac
+          ACTUAL=$(uname -m)
+          echo "runner=${ACTUAL} expected=${EXPECTED}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::arch ${MATRIX_ARCH} must build natively on ${EXPECTED}, runner is ${ACTUAL}"
+            exit 1
+          fi
 
       - name: Build binary
         env:
@@ -305,7 +320,7 @@ jobs:
 
   # ── Family sub-providers: build per-package per-arch (only selected packages) ──
   family-subproviders-build:
-    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-24.04"') }}
+    runs-on: ${{ matrix.runner }}
     needs: [prepare, family-config-push]
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -315,11 +330,12 @@ jobs:
       matrix:
         subpackage: ${{ fromJson(needs.prepare.outputs.subpackages) }}
         arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+          - arch: arm64
+            runner: ${{ vars.ARM_CI_RUNNER || 'ubuntu-24.04-arm' }}
     steps:
-      - name: Setup QEMU
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-        with: { platforms: arm64 }
-
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with: { version: '${{ env.DOCKER_BUILDX_VERSION }}' }
 
@@ -339,6 +355,21 @@ jobs:
         run: |
           curl -sL "https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh" | sh
           sudo mv crossplane /usr/local/bin/crossplane
+
+      - name: Verify native runner architecture
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          case "${MATRIX_ARCH}" in
+            amd64) EXPECTED=x86_64 ;;
+            arm64) EXPECTED=aarch64 ;;
+          esac
+          ACTUAL=$(uname -m)
+          echo "runner=${ACTUAL} expected=${EXPECTED}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "::error::arch ${MATRIX_ARCH} must build natively on ${EXPECTED}, runner is ${ACTUAL}"
+            exit 1
+          fi
 
       - name: Build binary
         env:
