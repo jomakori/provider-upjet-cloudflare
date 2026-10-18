@@ -149,7 +149,7 @@ jobs:
 
   # ── Family config: build per-arch (amd64/arm64) ────────────────────────
   family-config-build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
     needs: [prepare, ensure-repos]
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -158,9 +158,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+            runner: ${{ vars.CI_RUNNER || '"ubuntu-24.04"' }}
           - arch: arm64
-            runner: ${{ vars.ARM_CI_RUNNER || 'ubuntu-24.04-arm' }}
+            runner: ${{ vars.ARM_CI_RUNNER || '"ubuntu-24.04-arm"' }}
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with: { version: '${{ env.DOCKER_BUILDX_VERSION }}' }
@@ -276,6 +276,10 @@ jobs:
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { submodules: true }
+
       - name: Download single-platform packages
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -313,14 +317,13 @@ jobs:
           echo "Published: ${UPBOUND_REGISTRY}/${REPO}:${VERSION}"
 
       - name: Append extensions
-        continue-on-error: true
         run: |
           up xpkg append --extensions-root=./extensions \
             "${UPBOUND_REGISTRY}/provider-family-cloudflare:${VERSION}"
 
   # ── Family sub-providers: build per-package per-arch (only selected packages) ──
   family-subproviders-build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
     needs: [prepare, family-config-push]
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -332,9 +335,9 @@ jobs:
         arch: [amd64, arm64]
         include:
           - arch: amd64
-            runner: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
+            runner: ${{ vars.CI_RUNNER || '"ubuntu-24.04"' }}
           - arch: arm64
-            runner: ${{ vars.ARM_CI_RUNNER || 'ubuntu-24.04-arm' }}
+            runner: ${{ vars.ARM_CI_RUNNER || '"ubuntu-24.04-arm"' }}
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with: { version: '${{ env.DOCKER_BUILDX_VERSION }}' }
@@ -469,6 +472,10 @@ jobs:
       matrix:
         subpackage: ${{ fromJson(needs.prepare.outputs.subpackages) }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { submodules: true }
+
       - name: Download single-platform packages
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -509,7 +516,6 @@ jobs:
           echo "Published: ${UPBOUND_REGISTRY}/${REPO}:${VERSION}"
 
       - name: Append extensions
-        continue-on-error: true
         env:
           MATRIX_SUBPACKAGE: ${{ matrix.subpackage }}
         run: |
